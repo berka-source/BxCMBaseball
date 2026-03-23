@@ -11,6 +11,7 @@ const resetBtn = document.getElementById("resetBtn");
 const muteBtn = document.getElementById("muteBtn");
 const rightHandBtn = document.getElementById("rightHandBtn");
 const leftHandBtn = document.getElementById("leftHandBtn");
+const rightPanel = document.querySelector(".rightPanel");
 
 const scoreEl = document.getElementById("scoreEl");
 const pitchesEl = document.getElementById("pitchesEl");
@@ -33,7 +34,7 @@ pitchDelaySlider.oninput = () => pitchDelayVal.textContent = `${pitchDelaySlider
 
 let detector = null;
 let animationId = null;
-let gameState = "start";
+let gameState = "start"; // start | countdown | playing | paused | end
 let battingSide = "right";
 
 let score = 0;
@@ -53,19 +54,24 @@ let flashTimer = 0;
 let confetti = [];
 let floatingStars = [];
 let homerBursts = [];
+let homerTrailParticles = [];
+let batTrail = [];
 let pitchTimer = null;
 let screenShakeTimer = 0;
 let screenShakeAmount = 0;
+
+let countdownActive = false;
+let countdownValue = 5;
+let countdownTimer = null;
 
 const BALL_RADIUS = 14;
 const GRAVITY = 0.44;
 const CONTACT_DISTANCE = 68;
 const BAT_LENGTH = 132;
 
-// smaller overall figure on screen
-const SKELETON_SCALE = 0.75;
-const SKELETON_OFFSET_Y = 300;   // move skeleton/bat down
-const SKELETON_OFFSET_X = 0;    // keep centered left/right for now;
+const SKELETON_SCALE = 0.68;
+const SKELETON_OFFSET_Y = 100;
+const SKELETON_OFFSET_X = 0;
 
 // ---------- AUDIO ----------
 let audioCtx = null;
@@ -139,6 +145,16 @@ function playHomeRunSound() {
   tone(1046.5, 0.20, "triangle", 0.12, 0.42);
 }
 
+function playCountdownBeep(num) {
+  const f = num > 1 ? 660 : 880;
+  tone(f, 0.10, "triangle", 0.11, 0);
+}
+
+function playGoSound() {
+  tone(880, 0.08, "triangle", 0.12, 0);
+  tone(1174.66, 0.12, "triangle", 0.12, 0.08);
+}
+
 // ---------- HELPERS ----------
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
@@ -171,6 +187,27 @@ function clearPitchTimer() {
   }
 }
 
+function clearCountdownTimer() {
+  if (countdownTimer) {
+    clearTimeout(countdownTimer);
+    countdownTimer = null;
+  }
+}
+
+function showControlsPanel() {
+  if (!rightPanel) return;
+  rightPanel.style.transition = "opacity 500ms ease";
+  rightPanel.style.opacity = "1";
+  rightPanel.style.pointerEvents = "auto";
+}
+
+function hideControlsPanel() {
+  if (!rightPanel) return;
+  rightPanel.style.transition = "opacity 700ms ease";
+  rightPanel.style.opacity = "0.08";
+  rightPanel.style.pointerEvents = "none";
+}
+
 function scheduleNextPitch() {
   clearPitchTimer();
 
@@ -190,6 +227,7 @@ function scheduleNextPitch() {
 
 function resetRound() {
   clearPitchTimer();
+  clearCountdownTimer();
   score = 0;
   hits = 0;
   misses = 0;
@@ -204,10 +242,15 @@ function resetRound() {
   confetti = [];
   floatingStars = [];
   homerBursts = [];
+  homerTrailParticles = [];
+  batTrail = [];
   screenShakeTimer = 0;
   screenShakeAmount = 0;
+  countdownActive = false;
+  countdownValue = 5;
   updateHud();
   instructionChip.textContent = "Big upward swings can turn doubles into triples. Home runs trigger a giant celebration.";
+  showControlsPanel();
 }
 
 // ---------- CAMERA / MODEL ----------
@@ -241,7 +284,7 @@ async function loadModel() {
   );
 }
 
-// ---------- CODE-DRAWN INDOOR STADIUM BACKGROUND ----------
+// ---------- BACKGROUND ----------
 function drawRoundedRectPath(x, y, w, h, r) {
   ctx.beginPath();
   ctx.moveTo(x + r, y);
@@ -632,6 +675,53 @@ function midPoint(a, b, t = 0.5) {
   return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
 }
 
+function drawBatTrail() {
+  if (batTrail.length < 2) return;
+
+  for (let i = 1; i < batTrail.length; i++) {
+    const a = batTrail[i - 1];
+    const b = batTrail[i];
+    const alpha = i / batTrail.length;
+
+    ctx.save();
+    ctx.strokeStyle = `rgba(${a.color.r}, ${a.color.g}, ${a.color.b}, ${alpha * 0.55})`;
+    ctx.lineWidth = 4 + alpha * 8;
+    ctx.lineCap = "round";
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = `rgba(${a.color.r}, ${a.color.g}, ${a.color.b}, 0.8)`;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function updateBatTrail(batTip) {
+  if (!batTip) return;
+
+  const strong = batVelocity.speed > 520;
+  const color = strong
+    ? { r: 255, g: 208, b: 70 }
+    : { r: 88, g: 225, b: 255 };
+
+  batTrail.push({
+    x: batTip.x,
+    y: batTip.y,
+    life: 10,
+    color
+  });
+
+  if (batTrail.length > 12) batTrail.shift();
+}
+
+function tickBatTrail() {
+  for (let i = batTrail.length - 1; i >= 0; i--) {
+    batTrail[i].life--;
+    if (batTrail[i].life <= 0) batTrail.splice(i, 1);
+  }
+}
+
 function drawStickFigure(pose) {
   let ls = getKeypoint(pose, "left_shoulder");
   let rs = getKeypoint(pose, "right_shoulder");
@@ -913,6 +1003,20 @@ function resolveFinishedHit() {
   scheduleNextPitch();
 }
 
+function spawnHomeRunTrail() {
+  if (!ball || ball.result !== "HOME RUN!") return;
+
+  homerTrailParticles.push({
+    x: ball.x,
+    y: ball.y,
+    vx: (Math.random() - 0.5) * 1.5,
+    vy: (Math.random() - 0.5) * 1.5,
+    life: 18 + Math.random() * 8,
+    size: 4 + Math.random() * 5,
+    color: ["#ffd54f", "#ffffff", "#42a5f5", "#ff7043"][Math.floor(Math.random() * 4)]
+  });
+}
+
 function updateBall() {
   if (!ball || !ball.active) return;
   if (gameState !== "playing") return;
@@ -938,6 +1042,11 @@ function updateBall() {
     ball.trail.push({ x: ball.x, y: ball.y, a: 0.24 });
     if (ball.trail.length > 16) ball.trail.shift();
 
+    if (ball.result === "HOME RUN!") {
+      spawnHomeRunTrail();
+      spawnHomeRunTrail();
+    }
+
     if (ball.y > canvas.height + 60 || ball.x < -90 || ball.x > canvas.width + 90) {
       resolveFinishedHit();
     }
@@ -957,8 +1066,8 @@ function drawBall() {
   }
 
   ctx.save();
-  ctx.shadowBlur = 14;
-  ctx.shadowColor = "#ffffff";
+  ctx.shadowBlur = ball.result === "HOME RUN!" ? 24 : 14;
+  ctx.shadowColor = ball.result === "HOME RUN!" ? "#ffd54f" : "#ffffff";
   ctx.fillStyle = "#ffffff";
   ctx.beginPath();
   ctx.arc(ball.x, ball.y, BALL_RADIUS, 0, Math.PI * 2);
@@ -1126,6 +1235,27 @@ function updateAndDrawHomerBursts() {
   }
 }
 
+function updateAndDrawHomerTrailParticles() {
+  for (let i = homerTrailParticles.length - 1; i >= 0; i--) {
+    const p = homerTrailParticles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.life--;
+
+    ctx.save();
+    ctx.globalAlpha = Math.max(p.life / 24, 0);
+    ctx.fillStyle = p.color;
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    if (p.life <= 0) homerTrailParticles.splice(i, 1);
+  }
+}
+
 function drawHitOverlay() {
   if (hitTextTimer > 0) {
     const scale = 1 + Math.sin((34 - hitTextTimer) * 0.3) * 0.08;
@@ -1209,6 +1339,59 @@ function drawEndOverlay() {
   ctx.fillText(`Hits: ${hits}   |   Best EV: ${Math.round(bestExitVelo)}`, canvas.width / 2, canvas.height * 0.50);
 }
 
+function drawCountdownOverlay() {
+  ctx.fillStyle = "rgba(0,0,0,0.18)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffd54f";
+  ctx.lineWidth = 8;
+  ctx.strokeStyle = "#14304b";
+
+  if (countdownValue > 0) {
+    ctx.font = '900 120px "Baloo 2", sans-serif';
+    ctx.strokeText(String(countdownValue), canvas.width / 2, canvas.height * 0.45);
+    ctx.fillText(String(countdownValue), canvas.width / 2, canvas.height * 0.45);
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = '900 28px "Nunito", sans-serif';
+    ctx.fillText("Get set...", canvas.width / 2, canvas.height * 0.55);
+  } else {
+    ctx.font = '900 90px "Baloo 2", sans-serif';
+    ctx.strokeText("SWING!", canvas.width / 2, canvas.height * 0.45);
+    ctx.fillText("SWING!", canvas.width / 2, canvas.height * 0.45);
+  }
+}
+
+// ---------- COUNTDOWN ----------
+function startCountdown() {
+  clearCountdownTimer();
+  countdownActive = true;
+  countdownValue = 5;
+  gameState = "countdown";
+  instructionChip.textContent = "Get set...";
+  hideControlsPanel();
+
+  const tick = () => {
+    if (!countdownActive) return;
+
+    if (countdownValue > 0) {
+      playCountdownBeep(countdownValue);
+      instructionChip.textContent = `Starting in ${countdownValue}...`;
+      countdownValue--;
+      countdownTimer = setTimeout(tick, 1000);
+    } else {
+      playGoSound();
+      instructionChip.textContent = "Swing!";
+      countdownActive = false;
+      gameState = "playing";
+      createPitch();
+    }
+  };
+
+  tick();
+}
+
 // ---------- SIDE SELECT ----------
 function updateSideButtons() {
   if (battingSide === "right") {
@@ -1245,45 +1428,60 @@ async function loop() {
 
   let pose = null;
 
-  if (detector && gameState === "playing") {
+  if (detector && (gameState === "playing" || gameState === "countdown")) {
     const poses = await detector.estimatePoses(video, { flipHorizontal: true });
     pose = poses[0] || null;
   }
 
-  if (gameState === "playing") {
-    if (pose) {
-      const points = drawStickFigure(pose);
-      const battingArm = getBattingArm(points);
+  if (pose) {
+    const points = drawStickFigure(pose);
+    const battingArm = getBattingArm(points);
 
-      if (battingArm) {
-        const batTip = drawBatFromSide(battingArm.wrist, battingArm.elbow);
-        if (batTip) {
-          updateBatVelocity(batTip);
+    if (battingArm) {
+      const batTip = drawBatFromSide(battingArm.wrist, battingArm.elbow);
+      if (batTip) {
+        updateBatVelocity(batTip);
+        updateBatTrail(batTip);
+
+        if (gameState === "playing") {
           tryHit(batTip);
         }
       }
     }
+  }
 
+  drawBatTrail();
+
+  if (gameState === "playing") {
     updateBall();
     drawBall();
     updateAndDrawConfetti();
     updateAndDrawStars();
     updateAndDrawHomerBursts();
+    updateAndDrawHomerTrailParticles();
     drawHitOverlay();
 
     if (pitchesLeft <= 0 && !ball) {
       gameState = "end";
+      showControlsPanel();
       instructionChip.textContent = "Round over. Press Start Game to play again.";
     }
   } else {
     updateAndDrawConfetti();
     updateAndDrawStars();
     updateAndDrawHomerBursts();
+    updateAndDrawHomerTrailParticles();
     drawHitOverlay();
   }
 
+  tickBatTrail();
+
   if (gameState === "start") {
     drawStartOverlay();
+  }
+
+  if (gameState === "countdown") {
+    drawCountdownOverlay();
   }
 
   if (gameState === "paused") {
@@ -1311,6 +1509,7 @@ async function startOrResumeGame() {
     gameState = "playing";
     pauseBtn.textContent = "Pause Game";
     instructionChip.textContent = "Game resumed.";
+    hideControlsPanel();
     if (!ball) scheduleNextPitch();
     playStartSound();
     if (!animationId) loop();
@@ -1318,11 +1517,9 @@ async function startOrResumeGame() {
   }
 
   resetRound();
-  gameState = "playing";
   pauseBtn.textContent = "Pause Game";
-  instructionChip.textContent = "Get ready...";
-  scheduleNextPitch();
   playStartSound();
+  startCountdown();
 
   if (!animationId) {
     loop();
@@ -1334,24 +1531,44 @@ function togglePause() {
     gameState = "paused";
     pauseBtn.textContent = "Resume Game";
     clearPitchTimer();
+    clearCountdownTimer();
+    showControlsPanel();
+    instructionChip.textContent = "Game paused.";
+    return;
+  }
+
+  if (gameState === "countdown") {
+    gameState = "paused";
+    countdownActive = false;
+    clearCountdownTimer();
+    pauseBtn.textContent = "Resume Game";
+    showControlsPanel();
     instructionChip.textContent = "Game paused.";
     return;
   }
 
   if (gameState === "paused") {
-    gameState = "playing";
     pauseBtn.textContent = "Pause Game";
-    instructionChip.textContent = "Game resumed.";
-    if (!ball) scheduleNextPitch();
-    playStartSound();
+
+    if (!ball && hits === 0 && misses === 0 && pitchesLeft === roundPitches) {
+      startCountdown();
+    } else {
+      gameState = "playing";
+      hideControlsPanel();
+      instructionChip.textContent = "Game resumed.";
+      if (!ball) scheduleNextPitch();
+      playStartSound();
+    }
   }
 }
 
 function resetGame() {
   clearPitchTimer();
+  clearCountdownTimer();
   resetRound();
   gameState = "start";
   pauseBtn.textContent = "Pause Game";
+  showControlsPanel();
   instructionChip.textContent = "Big upward swings can turn doubles into triples. Home runs trigger a giant celebration.";
 }
 
@@ -1375,3 +1592,4 @@ updateSideButtons();
 updateHud();
 resizeCanvas();
 pitchDelayVal.textContent = `${pitchDelaySlider.value}s`;
+showControlsPanel();
